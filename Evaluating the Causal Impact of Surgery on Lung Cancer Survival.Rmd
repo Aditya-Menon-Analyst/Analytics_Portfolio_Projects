@@ -1,0 +1,421 @@
+---
+title: "Final Project"
+author: "Team6"
+date: "2025-03-02"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Methodology
+
+```{r}
+library(dplyr)
+library(ggplot2)
+library(MatchIt)
+library(lmtest)
+library(sandwich)
+library(AER)
+```
+
+```{r}
+df <- read.csv("cleaned_lung_cancer_data.csv")
+```
+### Method 1：RCT-DiM
+
+
+```{r}
+library(dplyr)
+
+df <- df %>%
+  mutate(Treatment = ifelse(treatment_type == "Surgery", 1, 0))
+n_treat <- df %>% filter(Treatment == 1) %>% nrow()
+set.seed(123)  
+control_sample <- df %>%
+  filter(Treatment == 0) %>%
+  sample_n(n_treat, replace = FALSE)
+matched_df <- df %>%
+  filter(Treatment == 1) %>%
+  bind_rows(control_sample)
+matched_summary <- matched_df %>%
+  group_by(Treatment) %>%
+  summarise(
+    Mean_Survived = mean(survived, na.rm = TRUE),
+    SD_Survived = sd(survived, na.rm = TRUE),
+    n = n()
+  )
+
+```
+
+
+Calculate DiM
+DiM is 0.0002335644, which means 'After undergoing surgery, the survival rate only increased by 0.023% (which is very small)'.
+```{r}
+
+dim_value <- matched_summary %>%
+  summarise(DiM = diff(Mean_Survived))
+dim_value
+
+```
+
+t-test
+The p-value of 0.7189 indicates that there is no statistically significant difference in survival rates between the treatment (surgery) and control (no surgery) groups, meaning we fail to reject the null hypothesis.
+
+```{r}
+t_test_result <- t.test(survived ~ Treatment, data = matched_df)
+t_test_result
+
+```
+
+box plot
+The survival rate distribution of the control group and the treatment group is almost identical.
+```{r}
+library(ggplot2)
+ggplot(matched_df, aes(x = factor(Treatment), y = survived, fill = factor(Treatment))) +
+  geom_boxplot() +
+  labs(x = "Treatment Group", y = "Survival Rate", fill = "Treatment") +
+  theme_minimal()
+
+```
+
+
+### Method 2：IV
+Using 2SLS to conducting IV methodology.
+
+first stage regression
+Conduct the first-stage regression to test the validity of the instrumental variable (IV).
+We need to find variables that affect treatment but do not directly influence outcome. Therefore, we selected four variables from the dataset to examine whether they could be used as instrumental variables (IVs). After attempting the first-stage regression, we found that all IVs had p-values greater than 0.05 (not statistically significant). The F-statistic is typically required to be greater than 10, but in this case, F = 0.7697 (far less than 10), indicating that the IVs are weak instruments. This suggests that we cannot use the variables from the dataset as valid IVs, as they barely explain the variation in Treatment, implying that Treatment is primarily influenced by other factors.
+```{r}
+first_stage <- lm(Treatment ~ cholesterol_level + hypertension + asthma + cirrhosis + age + gender + bmi + smoking_status, data = df)
+summary(first_stage)
+```
+
+```{r}
+f_stat <- summary(first_stage)$fstatistic[1]
+print(paste("First-stage F-statistic:", round(f_stat, 2)))
+```
+
+Second stage regression
+
+This section is the second-stage regression (Second-Stage Regression), used to estimate the causal effect of Treatment on survival, where:
+
+The instrumental variable (IV) method is used to address the endogeneity problem of Treatment.
+The IVs (cholesterol_level, hypertension, asthma, cirrhosis) are used to predict Treatment in the first stage, and then in the second stage, the predicted values are substituted for Treatment in the regression.
+```{r}
+library(AER) 
+iv_model <- ivreg(Treatment ~ age + gender + bmi + smoking_status | cholesterol_level + hypertension + asthma + cirrhosis + age + gender + bmi + smoking_status, data = df)
+summary(iv_model, vcov = sandwich)
+```
+Sargan Test
+
+```{r}
+sargan_test <- bptest(iv_model)
+print(sargan_test)
+```
+Since the analysis indicates that we have not found a valid IV, we consider switching to another analytical method: Propensity Score Matching (PSM).
+
+
+
+## Method 3：PSM
+
+Calculate "Surgery" Group vs. "Non Surgery" PSM（Based on age, gender, bmi, cancer_stage, smoking_status）。 Nearest neighbor matching was performed to ensure a similar distribution of covariates between the two groups of patients. Calculate the ATE (causal effect of surgery) after matching.
+
+```{r}
+
+library(MatchIt)
+library(dplyr)
+
+df <- df %>%
+  mutate(Treatment = ifelse(treatment_type == "Surgery", 1, 0))
+
+psm_model <- glm(Treatment ~ age + gender + bmi + cancer_stage + smoking_status,
+                 data = df, family = binomial)
+
+```
+
+```{r}
+
+match_model <- matchit(Treatment ~ age + gender + bmi + cancer_stage + smoking_status,
+                       data = df, method = "nearest")
+
+matched_data <- match.data(match_model)
+
+```
+
+```{r}
+ate_psm <- matched_data %>%
+  group_by(Treatment) %>%
+  summarise(mean_survival = mean(survived))
+
+print(ate_psm)
+```
+
+```{r}
+
+par(mfrow = c(2, 2))  
+plot(match_model)      
+
+```
+
+## Method 4：IPW
+
+Idea To calculate the propensity score of the Surgery group vs. the non-surgery group. Calculate the IPW weight (so that the covariates in the Surgery and non-surgery groups are distributed similarly). Weighted regression was used to estimate the causal effects of Surgery.
+
+```{r}
+library(ipw)
+
+```
+
+```{r}
+df$pscore <- predict(psm_model, type = "response")
+```
+
+```{r}
+df$weight <- ifelse(df$Treatment == 1, 1 / df$pscore, 1 / (1 - df$pscore))
+
+ipw_model <- lm(survived ~ Treatment, weights = df$weight, data = df)
+summary(ipw_model)
+```
+
+### **📌 Interpretation of Results**
+
+#### **Findings:**
+
+-   The estimated impact of **Surgery (Treatment) on Survival Rate is extremely small and statistically insignificant**.
+
+#### **Key Statistics:**
+
+`Treatment Coefficient: -0.0001067   p-value: 0.816`
+
+#### **Implications:**
+
+-   The **IPW estimate of the Treatment effect is very close to 0**, indicating an extremely small impact.
+
+-   **p-value = 0.816** → Suggests that Surgery has no statistically significant causal effect on Survival Rate.
+
+-   **R² is close to 0** → Indicates that the model has very little explanatory power, suggesting the presence of unobserved confounders.
+
+------------------------------------------------------------------------
+
+### **📌 Potential Issues**
+
+#### **Extreme Propensity Scores (pscore)**
+
+-   Your **propensity score distribution might be too extreme**, which can affect the validity of IPW.
+
+-   **If `pscore` is too extreme (close to 0 or 1), IPW may fail.**
+
+-   **Check the distribution of `pscore`** to verify whether it is excessively concentrated or skewed.
+
+```{r}
+summary(df$pscore)
+hist(df$pscore, breaks = 30, main = "Distribution of Propensity Scores")
+```
+
+### **📌 Issue: Highly Concentrated Propensity Scores**
+
+#### **Range:**
+
+`0.2485 ~ 0.2520`
+
+#### **Implications:**
+
+-   Nearly all individuals have **propensity scores close to 0.25**, indicating a lack of variability.
+
+-   The **Treatment variable (Surgery vs. Others) does not exhibit clear distinguishing characteristics** based on the observed covariates.
+
+-   **IPW (Inverse Probability Weighting) may be ineffective** because the computed weights from `1/pscore` and `1/(1 - pscore)` show minimal differences, leading to almost no variation.
+
+------------------------------------------------------------------------
+
+### **📌 Why is the Propensity Score Poorly Distributed?**
+
+#### **Ideal Scenario:**
+
+-   The **propensity score (`pscore`) should ideally range between 0 and 1** with substantial variation.
+
+#### **Possible Explanations for the Issue:**
+
+1.  **Weak Predictive Power of Covariates:**
+
+    -   The **selected covariates (e.g., `age`, `bmi`, `cancer_stage`) have little influence on treatment assignment**, making the estimated `pscore` ineffective.
+
+2.  **Unobserved Factors Driving Treatment Decisions:**
+
+    -   **Surgery decisions might be based on other unobserved factors**, rather than the included variables.
+
+------------------------------------------------------------------------
+
+### **📌 Why Might IPW Fail?**
+
+#### **Weight Calculation:**
+
+`df$weight <- ifelse(df$Treatment == 1, 1 / df$pscore, 1 / (1 - df$pscore))`
+
+#### **Core Issue:**
+
+-   Since **`pscore` is clustered around 0.25**, both `1/pscore` and `1/(1 - pscore)` produce almost **constant weights**, **eliminating the variation required for effective IPW adjustment**.
+
+
+
+
+
+## Method 5: Causal Random Forest
+
+### **📌 Implementing Causal Random Forest: Challenges & Approach**
+
+#### **Problem: Computational Limitations**
+
+While attempting to train a **Causal Random Forest (CRF) model** on the full dataset, we encountered **computational constraints** due to:
+
+-   **Large dataset size**: The high volume of data made the training process extremely slow.
+
+-   **Hardware limitations**: Our available computing resources were insufficient to process the full dataset efficiently.
+
+-   **Memory and runtime issues**: The model could not be fully trained within a reasonable timeframe due to excessive computational demand.
+
+Given these limitations, running CRF on the entire dataset was impractical.
+
+------------------------------------------------------------------------
+
+#### **Solution: Random Sampling Approach**
+
+To **demonstrate the feasibility of CRF despite computational constraints**, we adopted the following approach:
+
+-   **Randomly selected a subset of 50,000 observations** from the dataset to ensure a more representative sample.
+
+-   **Trained the CRF model on this reduced dataset**, maintaining the integrity of the methodology.
+
+-   **Examined preliminary results** to validate the applicability of CRF to our research question.
+
+------------------------------------------------------------------------
+
+#### **Considerations & Limitations**
+
+While this approach allows us to **illustrate the viability of CRF**, there are some inherent trade-offs:
+
+-   **Loss of statistical power**: A smaller dataset may reduce the precision of treatment effect estimates.
+
+-   **Potential variance in results**: Random sampling introduces variability, which may slightly alter results between runs.
+
+-   **Scalability concerns**: If sufficient computational resources were available, training on the full dataset would provide more robust insights.
+
+```{r}
+library(grf)
+library(dplyr)
+library(ggplot2)
+```
+
+```{r}
+outcome <- "survived"        
+treatment <- "Treatment"      
+controls <- c("age", "bmi", "cancer_stage", "smoking_status", 
+              "hypertension", "asthma", "cirrhosis", "cholesterol_level", "family_history") 
+
+# Convert categorical variables to numeric
+df$cancer_stage <- as.numeric(as.factor(df$cancer_stage))
+df$smoking_status <- as.numeric(as.factor(df$smoking_status))
+df$family_history <- as.numeric(as.factor(df$family_history))
+
+# Ensure Treatment and Outcome are numeric
+df$Treatment <- as.numeric(df$Treatment)
+df$survived <- as.numeric(df$survived)
+
+# Remove missing values (if any)
+df <- na.omit(df)
+```
+
+**Why?**
+
+-   Causal Forest requires **numeric features** for computation.
+
+-   `as.factor()` ensures that categorical variables are properly encoded.
+
+```{r}
+# Set a seed for reproducibility
+set.seed(42)
+
+# Randomly sample 1000 rows from the dataset
+df_sample <- df %>% sample_n(50000)
+
+# Extract matrices for CRF
+X <- as.matrix(df_sample[, controls])  # Covariates
+W <- df_sample[, treatment]            # Treatment variable
+Y <- df_sample[, outcome]              # Outcome variable
+```
+
+-   **Why?**
+
+    -   `X`: Features that **may influence both treatment assignment and outcome**.
+
+    -   `W`: The **treatment variable** (whether the patient had surgery).
+
+    -   `Y`: The **outcome variable** (whether the patient survived).
+
+```{r}
+# Train Causal Random Forest model
+cf_model <- causal_forest(X, W, Y)
+```
+
+-   **What happens here?**
+
+    -   `causal_forest()` builds multiple decision trees, **splitting based on treatment effect heterogeneity** rather than pure prediction.
+
+    -   It learns **how treatment (surgery) affects survival** while controlling for confounders.
+
+```{r}
+# Predict Individual Treatment Effects (ITE)
+ite <- predict(cf_model)$predictions
+
+# Compute Average Treatment Effect (ATE)
+ate <- mean(ite)
+print(paste("Average Treatment Effect (ATE):", round(ate, 4)))
+```
+
+-   **What happens here?**
+
+    -   This predicts **how much the treatment (surgery) influences survival for each individual**.
+
+    -   Instead of a single effect, it provides **personalized treatment effects**.
+
+-   **What does ATE tell us?**
+
+    -   If **ATE \> 0**, surgery **improves survival** on average.
+
+    -   If **ATE \< 0**, surgery **reduces survival** on average.
+
+    -   If **ATE ≈ 0**, surgery **has no overall effect**.
+
+```{r}
+# Plot the distribution of ITE estimates
+ggplot(data.frame(ITE = ite), aes(x = ITE)) +
+  geom_histogram(bins = 30, fill = "skyblue", color = "black", alpha = 0.7) +
+  labs(title = "Distribution of Individual Treatment Effects (ITE)", 
+       x = "Estimated Treatment Effect",
+       y = "Frequency") +
+  theme_minimal()
+
+```
+
+-   **hy visualize?**
+
+    -   If the **ITE distribution is highly skewed**, it suggests **some patients benefit more than others**.
+
+    -   If the **distribution is centered around 0**, it means **surgery has no strong impact**.
+
+```{r}
+ate_se <- sd(ite) / sqrt(length(ite))  # Standard error of ATE
+lower_ci <- ate - 1.96 * ate_se  # Lower bound (95% CI)
+upper_ci <- ate + 1.96 * ate_se  # Upper bound (95% CI)
+
+print(paste("95% Confidence Interval for ATE: [", round(lower_ci, 4), ",", round(upper_ci, 4), "]"))
+
+```
+
+-   **Why check confidence intervals?**
+
+    -   If **CI includes 0**, then surgery has **no statistically significant effect**.
+
+    -   If **CI does NOT include 0**, then **surgery significantly affects survival**.
